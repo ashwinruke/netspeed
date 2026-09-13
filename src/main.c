@@ -24,7 +24,17 @@ static IPAddr parse_ipv4(const char *s) {
     return (IPAddr)(a | (b << 8) | (c << 16) | (d << 24));
 }
 
-/* Sum InOctets and OutOctets across all interfaces.
+/* Should this interface be counted toward the total? */
+static int is_countable(const MIB_IF_ROW2 *row) {
+    if (row->InterfaceAndOperStatusFlags.FilterInterface)  return 0;
+    if (!row->InterfaceAndOperStatusFlags.HardwareInterface) return 0;
+    if (row->Type == IF_TYPE_SOFTWARE_LOOPBACK)            return 0;
+    if (row->Type == IF_TYPE_TUNNEL)                       return 0;
+    if (row->OperStatus != IfOperStatusUp)                 return 0;
+    return 1;
+}
+
+/* Sum InOctets and OutOctets across genuinely active interfaces.
    Returns 0 on success, non-zero on failure. */
 static int read_counters(ULONG64 *down, ULONG64 *up) {
     MIB_IF_TABLE2 *table = NULL;
@@ -34,8 +44,11 @@ static int read_counters(ULONG64 *down, ULONG64 *up) {
 
     ULONG64 in = 0, out = 0;
     for (ULONG i = 0; i < table->NumEntries; i++) {
-        in  += table->Table[i].InOctets;
-        out += table->Table[i].OutOctets;
+        MIB_IF_ROW2 *row = &table->Table[i];
+        if (!is_countable(row))
+            continue;
+        in  += row->InOctets;
+        out += row->OutOctets;
     }
 
     FreeMibTable(table);
@@ -94,9 +107,81 @@ static int ping_ms(IPAddr dest) {
     return result;
 }
 
+/* Print every interface with its type, status, and totals. */
+
+static const char *type_name(ULONG type) {
+    switch (type) {
+        case IF_TYPE_ETHERNET_CSMACD:    return "Ethernet";
+        case IF_TYPE_IEEE80211:          return "Wi-Fi";
+        case IF_TYPE_SOFTWARE_LOOPBACK:  return "Loopback";
+        case IF_TYPE_TUNNEL:             return "Tunnel";
+        case IF_TYPE_PPP:                return "PPP";
+        default:                         return "Other";
+    }
+}
+
+static void list_interfaces(void) {
+    MIB_IF_TABLE2 *table = NULL;
+
+    if (GetIfTable2(&table) != NO_ERROR) {
+        printf("Failed to read interface table\n");
+        return;
+    }
+
+    printf("\n  %-32s  %-9s  %-6s  %10s  %10s\n",
+           "Alias", "Type", "Status", "In (MB)", "Out (MB)");
+    printf("  %.32s  %.9s  %.6s  %.10s  %.10s\n",
+           "--------------------------------",
+           "---------", "------", "----------", "----------");
+
+    int shown = 0;
+
+    /* Counted interfaces first, then the rest. */
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1)
+            printf("\n  -- not counted --\n");
+
+        for (ULONG i = 0; i < table->NumEntries; i++) {
+            MIB_IF_ROW2 *row = &table->Table[i];
+            int counted = is_countable(row);
+
+            if (counted != (pass == 0))
+                continue;
+
+            /* In the second pass, hide the noise: filter layers and
+               adapters that have never carried a byte. */
+            if (pass == 1) {
+                if (row->InterfaceAndOperStatusFlags.FilterInterface) continue;
+                if (row->InOctets == 0 && row->OutOctets == 0)        continue;
+            }
+
+            printf("%s %-32.32ls  %-9s  %-6s  %10.1f  %10.1f\n",
+                   counted ? ">" : " ",
+                   row->Alias,
+                   type_name(row->Type),
+                   (row->OperStatus == IfOperStatusUp) ? "up" : "down",
+                   (double)row->InOctets  / (1024.0 * 1024.0),
+                   (double)row->OutOctets / (1024.0 * 1024.0));
+
+            if (counted) shown++;
+        }
+    }
+
+    printf("\n  %lu interfaces total, %d counted\n\n",
+           (unsigned long)table->NumEntries, shown);
+
+    FreeMibTable(table);
+}
+
 /* ---- main ------------------------------------------------------------- */
 
-int main(void) {
+int main(int argc, char **argv) {
+
+    if (argc > 1 && strcmp(argv[1], "--list") == 0) {
+        list_interfaces();
+        return 0;
+    }
+
     IPAddr ping_dest = parse_ipv4(PING_TARGET);
 
     ULONG64 prev_down = 0, prev_up = 0;
