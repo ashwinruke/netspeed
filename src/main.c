@@ -4,12 +4,30 @@
 #include <netioapi.h>
 #include <icmpapi.h>
 #include <windows.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define PING_TARGET   "1.1.1.1"
-#define PING_TIMEOUT  1000   /* ms */
-#define PING_EVERY    5      /* ticks between pings */
+#define PING_TIMEOUT  1000 // mili seconds
+#define PING_EVERY    5 /* ticks between pings */
+
+#define WM_TRAYICON   (WM_APP + 1)
+#define TIMER_ID      1
+#define TRAY_UID      1
+#define ID_TRAY_EXIT   1001
+#define ID_TRAY_RESET  1002
+
+static NOTIFYICONDATA g_nid;
+
+static ULONG64   g_prev_down, g_prev_up;
+static ULONGLONG g_prev_tick;
+static int       g_tick;
+static int       g_latency = -1;
+static IPAddr    g_ping_dest;
+static UINT g_taskbar_created;
+
 
 /* ---- helpers ---------------------------------------------------------- */
 
@@ -173,63 +191,187 @@ static void list_interfaces(void) {
     FreeMibTable(table);
 }
 
-/* ---- main ------------------------------------------------------------- */
+/* ---- tray -------------------------------------------------------------- */
+
+static void tray_add(HWND hwnd) {
+    memset(&g_nid, 0, sizeof g_nid);
+    g_nid.cbSize           = sizeof g_nid;
+    g_nid.hWnd             = hwnd;
+    g_nid.uID              = TRAY_UID;
+    g_nid.uFlags           = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    g_nid.uCallbackMessage = WM_TRAYICON;
+    g_nid.hIcon            = LoadIcon(NULL, IDI_APPLICATION);
+    snprintf(g_nid.szTip, sizeof g_nid.szTip, "NetSpeed: starting...");
+
+    Shell_NotifyIcon(NIM_ADD, &g_nid);
+}
+
+/* One poll: refresh counters, latency, and the tooltip. */
+static void tray_update(void) {
+    ULONG64 cur_down, cur_up;
+    if (read_counters(&cur_down, &cur_up) != 0)
+        return;
+
+    ULONGLONG cur_tick = GetTickCount64();
+    double elapsed = (double)(cur_tick - g_prev_tick) / 1000.0;
+    if (elapsed <= 0.0)
+        return;
+
+    ULONG64 d_delta = (cur_down > g_prev_down) ? cur_down - g_prev_down : 0;
+    ULONG64 u_delta = (cur_up   > g_prev_up)   ? cur_up   - g_prev_up   : 0;
+
+    g_prev_down = cur_down;
+    g_prev_up   = cur_up;
+    g_prev_tick = cur_tick;
+
+    if (g_tick % PING_EVERY == 0)
+        g_latency = ping_ms(g_ping_dest);
+    g_tick++;
+
+    char down_str[32], up_str[32];
+    format_speed((double)d_delta / elapsed, down_str, sizeof down_str);
+    format_speed((double)u_delta / elapsed, up_str,   sizeof up_str);
+
+    if (g_latency >= 0)
+        snprintf(g_nid.szTip, sizeof g_nid.szTip,
+                 "Down: %s\nUp: %s\nPing: %d ms", down_str, up_str, g_latency);
+    else
+        snprintf(g_nid.szTip, sizeof g_nid.szTip,
+                 "Down: %s\nUp: %s\nPing: --", down_str, up_str);
+
+    printf("\r%-40s", g_nid.szTip);   /* debug build only */
+    fflush(stdout);
+
+    g_nid.uFlags = NIF_TIP;
+    Shell_NotifyIcon(NIM_MODIFY, &g_nid);
+}
+
+static void show_tray_menu(HWND hwnd) {
+    POINT pt;
+    GetCursorPos(&pt);
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu)
+        return;
+
+    AppendMenu(menu, MF_STRING, ID_TRAY_RESET, "Reset counters");
+    AppendMenu(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(menu, MF_STRING, ID_TRAY_EXIT,  "Exit");
+
+    /* Required workaround — see note below. */
+    SetForegroundWindow(hwnd);
+
+    TrackPopupMenu(menu, TPM_RIGHTALIGN | TPM_BOTTOMALIGN,
+                   pt.x, pt.y, 0, hwnd, NULL);
+
+    PostMessage(hwnd, WM_NULL, 0, 0);
+
+    DestroyMenu(menu);
+}
+
+/* ---- window ------------------------------------------------------------ */
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+
+    /* Explorer restarted and rebuilt the taskbar — re-add our icon.
+       Can't be a switch case: g_taskbar_created is set at runtime,
+       and case labels must be compile-time constants. */
+    if (msg == g_taskbar_created) {
+        tray_add(hwnd);
+        return 0;
+    }
+
+    switch (msg) {
+
+    case WM_TIMER:
+        if (wp == TIMER_ID)
+            tray_update();
+        return 0;
+
+    case WM_TRAYICON:
+        /* For tray callbacks the mouse event arrives in lParam;
+           wParam holds the icon's uID. */
+        if (lp == WM_RBUTTONUP)
+            show_tray_menu(hwnd);
+        else if (lp == WM_LBUTTONDBLCLK)
+            DestroyWindow(hwnd);
+        return 0;
+
+    case WM_COMMAND:
+        /* High word of wParam is the notification code, so mask it off. */
+        switch (LOWORD(wp)) {
+
+        case ID_TRAY_EXIT:
+            DestroyWindow(hwnd);
+            break;
+
+        case ID_TRAY_RESET:
+            /* Re-baseline so the next tick measures from now. */
+            read_counters(&g_prev_down, &g_prev_up);
+            g_prev_tick = GetTickCount64();
+            g_tick      = 0;
+            break;
+        }
+        return 0;
+
+    case WM_DESTROY:
+        KillTimer(hwnd, TIMER_ID);
+        Shell_NotifyIcon(NIM_DELETE, &g_nid);
+        PostQuitMessage(0);
+        return 0;
+    }
+
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+
+/* ---- main -------------------------------------------------------------- */
 
 int main(int argc, char **argv) {
-
     if (argc > 1 && strcmp(argv[1], "--list") == 0) {
         list_interfaces();
         return 0;
     }
 
-    IPAddr ping_dest = parse_ipv4(PING_TARGET);
+    g_ping_dest = parse_ipv4(PING_TARGET);
 
-    ULONG64 prev_down = 0, prev_up = 0;
-
-    if (read_counters(&prev_down, &prev_up) != 0) {
+    if (read_counters(&g_prev_down, &g_prev_up) != 0) {
         printf("Failed to read interface table\n");
         return 1;
     }
-    ULONGLONG prev_tick = GetTickCount64();
+    g_prev_tick = GetTickCount64();
 
-    int tick = 0;
-    int latency = -1;
+    HINSTANCE inst = GetModuleHandle(NULL);
 
-    for (;;) {
-        Sleep(1000);
+    WNDCLASSEX wc;
+    memset(&wc, 0, sizeof wc);
+    wc.cbSize        = sizeof wc;
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = inst;
+    wc.lpszClassName = "NetSpeedWndClass";
 
-        ULONG64 cur_down, cur_up;
-        if (read_counters(&cur_down, &cur_up) != 0)
-            continue;
+    if (!RegisterClassEx(&wc)) {
+        printf("RegisterClassEx failed (%lu)\n", GetLastError());
+        return 1;
+    }
 
-        ULONGLONG cur_tick = GetTickCount64();
-        double elapsed = (double)(cur_tick - prev_tick) / 1000.0;
-        if (elapsed <= 0.0)
-            continue;
+    HWND hwnd = CreateWindowEx(0, "NetSpeedWndClass", "NetSpeed",
+                               0, 0, 0, 0, 0,
+                               NULL, NULL, inst, NULL);
+    if (!hwnd) {
+        printf("CreateWindowEx failed (%lu)\n", GetLastError());
+        return 1;
+    }
+    /* Deliberately no ShowWindow — the window exists only for messages. */
 
-        ULONG64 d_delta = (cur_down > prev_down) ? cur_down - prev_down : 0;
-        ULONG64 u_delta = (cur_up   > prev_up)   ? cur_up   - prev_up   : 0;
+    g_taskbar_created = RegisterWindowMessage(TEXT("TaskbarCreated"));
+    tray_add(hwnd);
+    SetTimer(hwnd, TIMER_ID, 1000, NULL);
 
-        prev_down = cur_down;
-        prev_up   = cur_up;
-        prev_tick = cur_tick;
-
-        if (tick % PING_EVERY == 0)
-            latency = ping_ms(ping_dest);
-        tick++;
-
-        char down_str[32], up_str[32], lat_str[16];
-        format_speed((double)d_delta / elapsed, down_str, sizeof down_str);
-        format_speed((double)u_delta / elapsed, up_str,   sizeof up_str);
-
-        if (latency >= 0)
-            snprintf(lat_str, sizeof lat_str, "%d ms", latency);
-        else
-            snprintf(lat_str, sizeof lat_str, "--");
-
-        printf("\rDown: %-12s  Up: %-12s  Ping: %-8s",
-               down_str, up_str, lat_str);
-        fflush(stdout);
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
     }
 
     return 0;

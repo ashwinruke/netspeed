@@ -9,4 +9,4 @@ release: src/main.c
 	$(CC) $(CFLAGS) -O2 src/main.c -o netspeed.exe $(LIBS) -mwindows
 
 clean:
-	rm -f netspeed.exe
+	del /q netspeed.exe 2>nul
