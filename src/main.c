@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #define PING_TARGET   "1.1.1.1"
 #define PING_TIMEOUT  1000 // mili seconds
@@ -19,6 +20,12 @@
 #define ID_TRAY_EXIT   1001
 #define ID_TRAY_RESET  1002
 
+#define HIST_LEN 16
+
+static double g_hist_down[HIST_LEN];
+static double g_hist_up[HIST_LEN];
+static int    g_hist_pos;
+
 static NOTIFYICONDATA g_nid;
 
 static ULONG64   g_prev_down, g_prev_up;
@@ -27,9 +34,22 @@ static int       g_tick;
 static int       g_latency = -1;
 static IPAddr    g_ping_dest;
 static UINT g_taskbar_created;
+static HICON g_current_icon = NULL;
 
 
 /* ---- helpers ---------------------------------------------------------- */
+
+/* Map a byte rate onto 0.0-1.0 logarithmically.
+   0 -> 0.0, 1 KB/s -> ~0.25, 1 MB/s -> ~0.75, 100 MB/s -> 1.0 */
+static double scale_log(double bytes_per_sec) {
+    if (bytes_per_sec < 1.0)
+        return 0.0;
+
+    double v = log10(bytes_per_sec) / 8.0;   /* 10^8 ~= 100 MB/s */
+    if (v < 0.0) v = 0.0;
+    if (v > 1.0) v = 1.0;
+    return v;
+}
 
 /* Convert "1.1.1.1" into an IPAddr. Returns 0 if the string is malformed.
    Built by hand so we don't need to link ws2_32 or call WSAStartup. */
@@ -206,7 +226,78 @@ static void tray_add(HWND hwnd) {
     Shell_NotifyIcon(NIM_ADD, &g_nid);
 }
 
-/* One poll: refresh counters, latency, and the tooltip. */
+
+/* Build a sparkline icon from the history buffers. */
+static HICON make_icon(void) {
+    int w = GetSystemMetrics(SM_CXSMICON);
+    int h = GetSystemMetrics(SM_CYSMICON);
+
+    HDC screen = GetDC(NULL);
+    HDC mem    = CreateCompatibleDC(screen);
+
+    HBITMAP color = CreateCompatibleBitmap(screen, w, h);
+    HBITMAP mask  = CreateBitmap(w, h, 1, 1, NULL);
+
+    ReleaseDC(NULL, screen);
+
+    HBITMAP old_bmp = SelectObject(mem, color);
+
+    /* Background */
+    RECT full = { 0, 0, w, h };
+    HBRUSH bg = CreateSolidBrush(RGB(16, 16, 16));
+    FillRect(mem, &full, bg);
+    DeleteObject(bg);
+
+    int mid = h / 2;
+
+    HBRUSH down_brush = CreateSolidBrush(RGB(80, 220, 120));   /* green */
+    HBRUSH up_brush   = CreateSolidBrush(RGB(255, 160, 60));   /* orange */
+
+    /* One column per pixel of width, oldest on the left. */
+    for (int x = 0; x < w; x++) {
+        int idx = (g_hist_pos + x) % HIST_LEN;
+
+        int dh = (int)(scale_log(g_hist_down[idx]) * mid);
+        int uh = (int)(scale_log(g_hist_up[idx])   * (h - mid - 1));
+
+        if (dh > 0) {
+            RECT bar = { x, mid - dh, x + 1, mid };
+            FillRect(mem, &bar, down_brush);
+        }
+        if (uh > 0) {
+            RECT bar = { x, mid + 1, x + 1, mid + 1 + uh };
+            FillRect(mem, &bar, up_brush);
+        }
+    }
+
+    DeleteObject(down_brush);
+    DeleteObject(up_brush);
+
+    /* Midline separator */
+    HBRUSH line = CreateSolidBrush(RGB(70, 70, 70));
+    RECT mid_rect = { 0, mid, w, mid + 1 };
+    FillRect(mem, &mid_rect, line);
+    DeleteObject(line);
+
+    SelectObject(mem, old_bmp);
+
+    ICONINFO ii;
+    memset(&ii, 0, sizeof ii);
+    ii.fIcon    = TRUE;
+    ii.hbmColor = color;
+    ii.hbmMask  = mask;
+
+    HICON icon = CreateIconIndirect(&ii);
+
+    DeleteObject(color);
+    DeleteObject(mask);
+    DeleteDC(mem);
+
+    return icon;
+}
+
+
+/* One poll: refresh counters, latency, tooltip, and the icon itself. */
 static void tray_update(void) {
     ULONG64 cur_down, cur_up;
     if (read_counters(&cur_down, &cur_up) != 0)
@@ -242,8 +333,30 @@ static void tray_update(void) {
     printf("\r%-40s", g_nid.szTip);   /* debug build only */
     fflush(stdout);
 
-    g_nid.uFlags = NIF_TIP;
-    Shell_NotifyIcon(NIM_MODIFY, &g_nid);
+    /* Push this second's readings into the ring buffer. */
+    g_hist_down[g_hist_pos] = (double)d_delta / elapsed;
+    g_hist_up[g_hist_pos]   = (double)u_delta / elapsed;
+    g_hist_pos = (g_hist_pos + 1) % HIST_LEN;
+
+    HICON new_icon = make_icon();
+
+    if (new_icon) {
+        HICON old_icon = g_current_icon;
+
+        g_nid.hIcon  = new_icon;
+        g_nid.uFlags = NIF_ICON | NIF_TIP;
+        Shell_NotifyIcon(NIM_MODIFY, &g_nid);
+
+        g_current_icon = new_icon;
+
+        /* Destroy only after the shell has taken the new one. */
+        if (old_icon)
+            DestroyIcon(old_icon);
+    } else {
+        /* Icon creation failed — still update the tooltip. */
+        g_nid.uFlags = NIF_TIP;
+        Shell_NotifyIcon(NIM_MODIFY, &g_nid);
+    }
 }
 
 static void show_tray_menu(HWND hwnd) {
@@ -317,6 +430,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_ID);
         Shell_NotifyIcon(NIM_DELETE, &g_nid);
+        if (g_current_icon)
+            DestroyIcon(g_current_icon);
         PostQuitMessage(0);
         return 0;
     }
