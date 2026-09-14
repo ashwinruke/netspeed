@@ -1,18 +1,25 @@
 # NetSpeed
  
-A small background utility written in C that shows live network speed on Windows.
-Currently a console tool; a system tray icon with the speed drawn into it is in progress.
+A small background utility written in C that shows live network activity as a
+system tray icon on Windows. The icon is redrawn every second as a scrolling
+sparkline, so you can see what the connection is doing without hovering over
+anything.
  
-**Status:** in development — Milestones 0–2 complete.
+**Status:** Milestones 0–5 complete. Polish and shipping (M6) in progress.
  
 ---
  
 ## Screenshots
  
-### Live readout
+### The tray icon
  
-<!-- TODO: screenshot of netspeed.exe running, showing Down / Up / Ping -->
-![Live speed and latency readout](docs/screenshot-live.png)
+<!-- TODO: screenshot of the sparkline icon in the taskbar, zoomed if possible -->
+![Sparkline icon in the taskbar](docs/screenshot-tray.png)
+ 
+### Tooltip
+ 
+<!-- TODO: screenshot of the hover tooltip showing Down / Up / Ping -->
+![Tooltip with exact figures](docs/screenshot-tooltip.png)
  
 ### Interface detection
  
@@ -23,10 +30,14 @@ Currently a console tool; a system tray icon with the speed drawn into it is in 
  
 ## What it does
  
-- Reports download and upload speed once per second, in bytes
-- Reports round-trip latency to `1.1.1.1`, sampled every 5 seconds
-- Detects active network interfaces automatically — works on Wi-Fi,
-  Ethernet, or a phone hotspot with no configuration
+- Draws a live sparkline into the 16×16 tray icon — download above the
+  midline in green, upload below in orange, 16 seconds of history scrolling
+  right to left
+- Hover for exact figures: download, upload, and round-trip latency
+- Detects active network interfaces automatically — Wi-Fi, Ethernet, or a
+  phone hotspot, with no configuration
+- Right-click menu to reset counters or exit
+- Survives Explorer restarts — the icon comes back on its own
 - `--list` shows which interfaces are being counted and why
 ---
  
@@ -41,7 +52,7 @@ pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-make
 Add `C:\msys64\ucrt64\bin` to `PATH`, then from the project root:
  
 ```
-make           # debug build, keeps the console
+make           # debug build, keeps the console for printf
 make release   # optimised, console hidden (-mwindows)
 ```
  
@@ -50,15 +61,20 @@ make release   # optimised, console hidden (-mwindows)
 ## Usage
  
 ```
-netspeed.exe           # live readout
-netspeed.exe --list    # show detected interfaces
+netspeed.exe           # run in the tray
+netspeed.exe --list    # show detected interfaces and exit
 ```
  
-Press Ctrl+C to stop.
+Right-click the tray icon for the menu, or double-click it to exit.
+ 
+Windows hides new tray icons by default. To keep NetSpeed visible:
+**Settings → Personalization → Taskbar → Other system tray icons → NetSpeed → On**
  
 ---
  
 ## How it works
+ 
+### Measuring speed
  
 Windows keeps a cumulative byte counter for every network interface.
 `GetIfTable2()` returns the whole table; the program reads it once a second and
@@ -70,9 +86,10 @@ speed = (bytes_now - bytes_before) / seconds_elapsed
  
 Two details that the obvious implementation gets wrong:
  
-**Elapsed time is measured, not assumed.** `Sleep(1000)` guarantees only a
-minimum. Each reading is timestamped with `GetTickCount64()` and the real
-interval is used, so readings stay accurate when the system is loaded.
+**Elapsed time is measured, not assumed.** `Sleep(1000)` and `WM_TIMER`
+guarantee only a minimum interval. Each reading is timestamped with
+`GetTickCount64()` and the real elapsed time is used, so readings stay accurate
+when the system is loaded.
  
 **Counters can go backwards.** Switching networks or resetting an adapter
 restarts its counter at zero. Since the counters are unsigned, a naive
@@ -101,6 +118,54 @@ Interfaces are filtered on the `MIB_IF_ROW2` status flags:
  
 On a typical laptop this reduces 54 rows to one.
  
+### Drawing the icon
+ 
+The tray accepts only a 16×16 icon — there is no API for putting text in the
+taskbar. So a fresh icon is generated every second: a memory DC, a colour
+bitmap and a mask bitmap, the sparkline drawn with `FillRect`, then
+`CreateIconIndirect` and `Shell_NotifyIcon(NIM_MODIFY)`.
+ 
+**Why a sparkline and not digits.** The first attempt drew the speed as text.
+At 16 pixels only two or three characters fit, there is no room for a unit
+suffix, and encoding the unit as text colour turned out to be unreadable at a
+glance. Shapes survive the resolution where glyphs do not, so the icon shows
+*shape and trend* and the tooltip carries the exact numbers.
+ 
+**Scaling is logarithmic.** Throughput spans five orders of magnitude, from a
+few hundred B/s of background chatter to tens of MB/s. Scaling linearly against
+a rolling peak makes everything except the peak invisible, and the meaning of
+"tall" changes constantly. A fixed `log10` scale means a given bar height always
+represents the same speed.
+ 
+### The GDI handle trap
+ 
+`CreateIconIndirect` copies the bitmaps it is given, so they must be deleted
+immediately afterwards — and the icon installed on the *previous* tick must be
+destroyed once the shell has taken the new one.
+ 
+Miss either and the process leaks one GDI handle per second. Windows caps a
+process at 10,000 GDI objects; at one per second the ceiling arrives in under
+three hours, `CreateIconIndirect` starts returning `NULL`, and the icon silently
+stops updating. No crash, no error, no message.
+ 
+<!-- TODO: before/after screenshot of the GDI objects column in Task Manager -->
+ 
+Task Manager's **GDI objects** column (Details tab → right-click headers →
+Select columns) makes it visible: a leaking build climbs steadily, a correct one
+sits flat.
+ 
+### Surviving Explorer restarts
+ 
+When `explorer.exe` restarts, the taskbar is rebuilt and every tray icon is
+wiped — the process keeps running, but invisibly. Windows broadcasts a
+`TaskbarCreated` message when the new taskbar is ready; registering for it with
+`RegisterWindowMessage` and re-adding the icon on receipt fixes this.
+ 
+This is also why the program creates a hidden top-level window rather than a
+message-only (`HWND_MESSAGE`) one. Message-only windows are excluded from
+broadcasts by design, so the tempting shortcut would have made this feature
+impossible without restructuring.
+ 
 ---
  
 ## Known limitations
@@ -108,21 +173,22 @@ On a typical laptop this reduces 54 rows to one.
 - Windows only — built entirely on Win32 APIs
 - Reports **bytes**, not bits. Speed test sites report megabits;
   divide their figure by 8 to compare
-- Uses binary units (1 MB = 1024²  bytes), unlike most network tools
+- Uses binary units (1 MB = 1024² bytes), unlike most network tools
 - Polls once a second, so brief spikes are averaged away
 - Traffic through a VPN is counted at the physical adapter, so it reflects
   encrypted wire traffic rather than the plaintext inside the tunnel
-- Latency probe blocks briefly on a dead connection
+- The latency probe runs on the UI thread and blocks for up to a second on a
+  dead connection
 ---
  
 ## Roadmap
  
 - [x] M0 — Toolchain, Makefile, repo
-- [x] M1 — Console readout with clock-drift and counter-reset handling
+- [x] M1 — Live readout with clock-drift and counter-reset handling
 - [x] M2 — Automatic interface detection, `--list`
-- [ ] M3 — Tray icon with live tooltip
-- [ ] M4 — Right-click menu, survives Explorer restarts
-- [ ] M5 — Speed drawn into the 16×16 icon itself
+- [x] M3 — Tray icon with live tooltip
+- [x] M4 — Right-click menu, survives Explorer restarts
+- [x] M5 — Sparkline drawn into the icon, no GDI leaks
 - [ ] M6 — Config file, daily usage log, autostart, real icon
 ### Future work
  
@@ -130,8 +196,3 @@ On a typical laptop this reduces 54 rows to one.
 - Move the latency probe to a worker thread so it can never block the UI
 - Exclude interfaces by alias from the config file
 ---
- 
-## License
- 
-MIT
- 
