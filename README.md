@@ -188,31 +188,6 @@ rolling peak makes everything except the peak invisible, and the meaning of
 "tall" changes from second to second. A fixed `log10` scale means a given bar
 height always represents the same speed.
  
-### The GDI handle trap
- 
-This is the part worth reading.
- 
-`CreateIconIndirect` copies the bitmaps it is given, so they must be deleted
-immediately afterwards — and the icon installed on the *previous* tick must be
-destroyed once the shell has taken the new one.
- 
-Miss either and the process leaks one GDI handle per second. Windows caps a
-process at 10,000 GDI objects. At one per second the ceiling arrives in under
-three hours, `CreateIconIndirect` starts returning `NULL`, and the icon silently
-stops updating. No crash, no error, no log entry — just a frozen icon.
- 
-<!-- TODO: before/after screenshot of the GDI objects column in Task Manager -->
-![GDI object count, leaking vs fixed](docs/screenshot-gdi.png)
- 
-Task Manager's **GDI objects** column (Details tab → right-click headers →
-Select columns) makes it visible: a leaking build climbs steadily, a correct one
-sits flat indefinitely.
- 
-The same discipline applies throughout — every `CreatePopupMenu` has a matching
-`DestroyMenu`, every `CreateFont` a `DeleteObject`, and GDI objects are
-unselected from their DC before being deleted, since a selected object cannot be
-freed and `DeleteObject` fails silently when you try.
- 
 ### Surviving Explorer restarts
  
 When `explorer.exe` restarts, the taskbar is rebuilt and every tray icon is
