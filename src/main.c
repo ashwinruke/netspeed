@@ -19,8 +19,11 @@
 #define TRAY_UID      1
 #define ID_TRAY_EXIT   1001
 #define ID_TRAY_RESET  1002
+#define ID_TRAY_AUTOSTART 1003
 
 #define HIST_LEN 16
+#define RUN_KEY   "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define RUN_NAME  "NetSpeed"
 
 static double g_hist_down[HIST_LEN];
 static double g_hist_up[HIST_LEN];
@@ -36,6 +39,13 @@ static IPAddr    g_ping_dest;
 static UINT g_taskbar_created;
 static HICON g_current_icon = NULL;
 
+static int  g_interval    = 1000;
+static char g_ping_target[64] = PING_TARGET;
+static int  g_ping_every  = PING_EVERY;
+
+static int g_log_day = -1;
+static ULONG64 g_day_down, g_day_up;
+
 
 /* ---- helpers ---------------------------------------------------------- */
 
@@ -50,6 +60,84 @@ static double scale_log(double bytes_per_sec) {
     if (v > 1.0) v = 1.0;
     return v;
 }
+
+/* Is autostart currently enabled? */
+static int autostart_enabled(void) {
+    HKEY key;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_READ, &key) != ERROR_SUCCESS)
+        return 0;
+
+    LONG r = RegQueryValueEx(key, RUN_NAME, NULL, NULL, NULL, NULL);
+    RegCloseKey(key);
+
+    return (r == ERROR_SUCCESS);
+}
+
+/* Turn autostart on or off. Returns 0 on success. */
+static int autostart_set(int enable) {
+    HKEY key;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS)
+        return 1;
+
+    LONG r;
+
+    if (enable) {
+        char path[MAX_PATH];
+        if (GetModuleFileName(NULL, path, MAX_PATH) == 0) {
+            RegCloseKey(key);
+            return 1;
+        }
+
+        /* Quote it — an unquoted path with spaces is both broken and a
+           classic privilege-escalation vector. */
+        char quoted[MAX_PATH + 2];
+        snprintf(quoted, sizeof quoted, "\"%s\"", path);
+
+        r = RegSetValueEx(key, RUN_NAME, 0, REG_SZ,
+                          (const BYTE *)quoted,
+                          (DWORD)(strlen(quoted) + 1));
+    } else {
+        r = RegDeleteValue(key, RUN_NAME);
+    }
+
+    RegCloseKey(key);
+    return (r == ERROR_SUCCESS) ? 0 : 1;
+}
+
+/* Append yesterday's totals when the date rolls over. */
+static void log_daily(ULONG64 d_delta, ULONG64 u_delta) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    if (g_log_day == -1) {
+        g_log_day = st.wDay;
+    } else if (st.wDay != g_log_day) {
+        char path[MAX_PATH];
+        if (GetModuleFileName(NULL, path, MAX_PATH) > 0) {
+            char *slash = strrchr(path, '\\');
+            if (slash) {
+                snprintf(slash + 1, sizeof path - (slash + 1 - path),
+                         "netspeed-usage.csv");
+
+                FILE *f = fopen(path, "a");
+                if (f) {
+                    fprintf(f, "%04d-%02d-%02d,%llu,%llu\n",
+                            st.wYear, st.wMonth, st.wDay,
+                            (unsigned long long)g_day_down,
+                            (unsigned long long)g_day_up);
+                    fclose(f);
+                }
+            }
+        }
+        g_day_down = 0;
+        g_day_up   = 0;
+        g_log_day  = st.wDay;
+    }
+
+    g_day_down += d_delta;
+    g_day_up   += u_delta;
+}
+
 
 /* Convert "1.1.1.1" into an IPAddr. Returns 0 if the string is malformed.
    Built by hand so we don't need to link ws2_32 or call WSAStartup. */
@@ -311,11 +399,13 @@ static void tray_update(void) {
     ULONG64 d_delta = (cur_down > g_prev_down) ? cur_down - g_prev_down : 0;
     ULONG64 u_delta = (cur_up   > g_prev_up)   ? cur_up   - g_prev_up   : 0;
 
+    log_daily(d_delta, u_delta);
+
     g_prev_down = cur_down;
     g_prev_up   = cur_up;
     g_prev_tick = cur_tick;
 
-    if (g_tick % PING_EVERY == 0)
+    if (g_tick % g_ping_every == 0)
         g_latency = ping_ms(g_ping_dest);
     g_tick++;
 
@@ -329,9 +419,6 @@ static void tray_update(void) {
     else
         snprintf(g_nid.szTip, sizeof g_nid.szTip,
                  "Down: %s\nUp: %s\nPing: --", down_str, up_str);
-
-    printf("\r%-40s", g_nid.szTip);   /* debug build only */
-    fflush(stdout);
 
     /* Push this second's readings into the ring buffer. */
     g_hist_down[g_hist_pos] = (double)d_delta / elapsed;
@@ -368,6 +455,10 @@ static void show_tray_menu(HWND hwnd) {
         return;
 
     AppendMenu(menu, MF_STRING, ID_TRAY_RESET, "Reset counters");
+
+    AppendMenu(menu, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0),
+               ID_TRAY_AUTOSTART, "Start with Windows");
+    
     AppendMenu(menu, MF_SEPARATOR, 0, NULL);
     AppendMenu(menu, MF_STRING, ID_TRAY_EXIT,  "Exit");
 
@@ -424,6 +515,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_prev_tick = GetTickCount64();
             g_tick      = 0;
             break;
+        case ID_TRAY_AUTOSTART:
+            autostart_set(!autostart_enabled());
+            break;
         }
         return 0;
 
@@ -439,6 +533,43 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
+/* Read key=value lines from netspeed.cfg beside the exe.
+   Missing file is fine — defaults stay. */
+static void load_config(void) {
+    char path[MAX_PATH];
+    if (GetModuleFileName(NULL, path, MAX_PATH) == 0)
+        return;
+
+    char *slash = strrchr(path, '\\');
+    if (!slash) return;
+    snprintf(slash + 1, sizeof path - (slash + 1 - path), "netspeed.cfg");
+
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#' || line[0] == '\n')
+            continue;
+
+        char key[64], val[64];
+        if (sscanf(line, "%63[^=]=%63s", key, val) != 2)
+            continue;
+
+        if (strcmp(key, "interval_ms") == 0) {
+            int v = atoi(val);
+            if (v >= 200 && v <= 60000) g_interval = v;
+        } else if (strcmp(key, "ping_target") == 0) {
+            snprintf(g_ping_target, sizeof g_ping_target, "%s", val);
+        } else if (strcmp(key, "ping_every") == 0) {
+            int v = atoi(val);
+            if (v >= 1 && v <= 60) g_ping_every = v;
+        }
+    }
+
+    fclose(f);
+}
+
 
 /* ---- main -------------------------------------------------------------- */
 
@@ -448,7 +579,8 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    g_ping_dest = parse_ipv4(PING_TARGET);
+    load_config();
+    g_ping_dest = parse_ipv4(g_ping_target);
 
     if (read_counters(&g_prev_down, &g_prev_up) != 0) {
         printf("Failed to read interface table\n");
@@ -481,7 +613,7 @@ int main(int argc, char **argv) {
 
     g_taskbar_created = RegisterWindowMessage(TEXT("TaskbarCreated"));
     tray_add(hwnd);
-    SetTimer(hwnd, TIMER_ID, 1000, NULL);
+    SetTimer(hwnd, TIMER_ID, g_interval, NULL);
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {

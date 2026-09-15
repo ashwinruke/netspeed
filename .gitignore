@@ -2,3 +2,6 @@
 *.o
 netspeed.log
 config.txt
+netspeed-usage.csv
+netspeed.cfg
+resource.o
